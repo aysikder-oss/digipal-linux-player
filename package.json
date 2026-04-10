@@ -11,7 +11,10 @@
     "build:rpm": "electron-builder --linux rpm",
     "build:arm64": "electron-builder --linux --arm64"
   },
-  "author": "Digipal",
+  "author": {
+    "name": "Digipal",
+    "email": "support@digipal.app"
+  },
   "license": "MIT",
   "devDependencies": {
     "electron": "^32.0.0",
