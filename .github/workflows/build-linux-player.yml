@@ -30,9 +30,7 @@ jobs:
 
       - name: Build x64 packages
         run: |
-          npx electron-builder --linux deb AppImage rpm --x64
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npx electron-builder --linux deb AppImage rpm --x64 --publish never
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
@@ -72,17 +70,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Install cross-compilation dependencies
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y libc6-dev-arm64-cross
-
       - name: Build arm64 packages
         run: |
-          npx electron-builder --linux deb AppImage rpm --arm64
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          npx electron-builder --linux deb --arm64 --publish never
 
       - name: Upload DEB arm64 artifact
         uses: actions/upload-artifact@v4
