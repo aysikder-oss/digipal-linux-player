@@ -106,6 +106,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-x64, build-arm64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download all artifacts
