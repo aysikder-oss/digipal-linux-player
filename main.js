@@ -1,19 +1,25 @@
 const { app, BrowserWindow, Menu, globalShortcut, dialog, shell, ipcMain, protocol, net, Tray, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 const MediaManager = require('./media-manager');
 const BonjourBrowser = require('./bonjour-browser');
+const ConnectionManager = require('./connection-manager');
 
 const PLAYER_PATH = '/tv';
 const CONFIG_FILE = 'config.json';
 const CURSOR_HIDE_DELAY = 3000;
+const DEFAULT_CLOUD_URL = 'https://app.digipal.app';
 
 let mainWindow = null;
+let searchingWindow = null;
 let tray = null;
 let kioskMode = false;
 let serverUrl = '';
 let mediaManager = null;
 let bonjourBrowser = null;
+let connectionManager = null;
 let cursorHideTimer = null;
 let cursorHidden = false;
 
@@ -30,24 +36,76 @@ function loadConfig() {
     const configPath = getConfigPath();
     if (fs.existsSync(configPath)) {
       const data = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      if (data.serverUrl) {
-        serverUrl = data.serverUrl;
-        return true;
-      }
+      return data;
     }
   } catch (e) {
     console.error('Failed to load config:', e.message);
   }
-  return false;
+  return null;
 }
 
-function saveConfig(url) {
+function saveConfig(url, manualOverride = false) {
   try {
     const configPath = getConfigPath();
-    fs.writeFileSync(configPath, JSON.stringify({ serverUrl: url }, null, 2), 'utf-8');
+    const existing = loadConfig() || {};
+    const data = {
+      serverUrl: url,
+      manualOverride,
+      deviceId: existing.deviceId || crypto.randomUUID(),
+    };
+    fs.writeFileSync(configPath, JSON.stringify(data, null, 2), 'utf-8');
     serverUrl = url;
+    return data;
   } catch (e) {
     console.error('Failed to save config:', e.message);
+    return null;
+  }
+}
+
+function clearManualOverride() {
+  try {
+    const configPath = getConfigPath();
+    const existing = loadConfig();
+    const deviceId = existing && existing.deviceId;
+    if (deviceId) {
+      fs.writeFileSync(configPath, JSON.stringify({ deviceId }, null, 2), 'utf-8');
+    } else if (fs.existsSync(configPath)) {
+      fs.unlinkSync(configPath);
+    }
+    serverUrl = '';
+  } catch (e) {
+    console.error('Failed to clear config:', e.message);
+  }
+}
+
+function showSearchingScreen() {
+  return new Promise((resolve) => {
+    searchingWindow = new BrowserWindow({
+      width: 500,
+      height: 300,
+      resizable: false,
+      frame: false,
+      backgroundColor: '#0f172a',
+      icon: path.join(__dirname, 'icon.png'),
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    });
+
+    searchingWindow.loadFile(path.join(__dirname, 'searching.html'));
+    searchingWindow.on('closed', () => {
+      searchingWindow = null;
+    });
+
+    resolve();
+  });
+}
+
+function closeSearchingScreen() {
+  if (searchingWindow && !searchingWindow.isDestroyed()) {
+    searchingWindow.close();
+    searchingWindow = null;
   }
 }
 
@@ -69,7 +127,7 @@ function showSetupPrompt() {
     promptWindow.loadFile(path.join(__dirname, 'prompt.html'));
 
     const onSubmit = (_event, url) => {
-      saveConfig(url);
+      saveConfig(url, true);
       promptWindow.close();
       resolve(url);
     };
@@ -79,9 +137,6 @@ function showSetupPrompt() {
     promptWindow.on('closed', () => {
       ipcMain.removeListener('server-url-submitted', onSubmit);
       resolve(serverUrl || null);
-      if (!serverUrl) {
-        app.quit();
-      }
     });
   });
 }
@@ -170,12 +225,15 @@ function createWindow() {
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
     console.error(`Failed to load: ${errorDescription} (${errorCode})`);
     retryCount++;
-    const delay = Math.min(5 * retryCount, 30);
+    const delay = Math.min(
+      Math.round(5 * Math.pow(2, retryCount - 1)),
+      60
+    );
     showRetryOverlay(delay);
     setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         console.log(`Retrying connection (attempt ${retryCount})...`);
-        mainWindow.loadURL(playerUrl);
+        mainWindow.loadURL(serverUrl + PLAYER_PATH + '?platform=linux');
       }
     }, delay * 1000);
   });
@@ -226,6 +284,9 @@ function createWindow() {
     const previousUrl = serverUrl;
     await showSetupPrompt();
     if (serverUrl !== previousUrl && mainWindow && !mainWindow.isDestroyed()) {
+      if (connectionManager) {
+        connectionManager.switchPrimary(serverUrl);
+      }
       mainWindow.loadURL(serverUrl + PLAYER_PATH + '?platform=linux');
     }
   });
@@ -260,10 +321,16 @@ function createTray() {
 
 function updateTray() {
   if (!tray) return;
+  const state = connectionManager ? connectionManager.getState() : {};
+  const modeLabel = state.primaryMode === 'local' ? 'Local Server' : 'Cloud';
+  const config = loadConfig();
+  const isManual = config && config.manualOverride;
+
   const contextMenu = Menu.buildFromTemplate([
     { label: `Digipal Player v${app.getVersion()}`, enabled: false },
     { type: 'separator' },
     { label: `Server: ${serverUrl || 'Not configured'}`, enabled: false },
+    { label: `Mode: ${modeLabel}${state.cloudConnected ? ' + Cloud Channel' : ''}`, enabled: false },
     { label: `Kiosk: ${kioskMode ? 'ON' : 'OFF'}`, enabled: false },
     { type: 'separator' },
     {
@@ -272,10 +339,28 @@ function updateTray() {
         const previousUrl = serverUrl;
         await showSetupPrompt();
         if (serverUrl !== previousUrl && mainWindow && !mainWindow.isDestroyed()) {
+          if (connectionManager) {
+            connectionManager.switchPrimary(serverUrl);
+          }
           mainWindow.loadURL(serverUrl + PLAYER_PATH + '?platform=linux');
         }
       }
     },
+    {
+      label: 'Reset to Auto-Discover',
+      enabled: isManual,
+      click: async () => {
+        clearManualOverride();
+        if (connectionManager) {
+          connectionManager.stop();
+        }
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.close();
+        }
+        await startAutoConnect();
+      }
+    },
+    { type: 'separator' },
     {
       label: kioskMode ? 'Exit Kiosk Mode' : 'Enter Kiosk Mode',
       click: () => {
@@ -315,7 +400,7 @@ function updateTray() {
     }
   ]);
   tray.setContextMenu(contextMenu);
-  tray.setToolTip(`Digipal Player - ${kioskMode ? 'Kiosk Mode' : 'Normal'}`);
+  tray.setToolTip(`Digipal Player - ${kioskMode ? 'Kiosk Mode' : modeLabel}`);
 }
 
 function setupAutoStart(enabled) {
@@ -387,6 +472,94 @@ function setupMediaIPC() {
   });
 }
 
+function getDeviceInfo() {
+  return {
+    platform: 'linux',
+    version: app.getVersion(),
+    osVersion: os.release(),
+    arch: os.arch(),
+    hostname: os.hostname(),
+    totalMemory: os.totalmem(),
+    freeMemory: os.freemem(),
+    cpus: os.cpus().length,
+    uptime: os.uptime(),
+  };
+}
+
+async function captureScreenshot() {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  try {
+    const image = await mainWindow.webContents.capturePage();
+    return image.toDataURL();
+  } catch (e) {
+    console.error('Screenshot capture failed:', e);
+    return null;
+  }
+}
+
+async function startAutoConnect() {
+  const config = loadConfig();
+
+  connectionManager = new ConnectionManager({
+    bonjourBrowser,
+    cloudUrl: DEFAULT_CLOUD_URL,
+    platform: 'linux',
+    deviceId: (config && config.deviceId) || crypto.randomUUID(),
+    getDeviceInfo,
+    captureScreenshot,
+  });
+
+  connectionManager.on('searching', () => {
+    console.log('[main] Searching for local server...');
+    showSearchingScreen();
+  });
+
+  connectionManager.on('retrying', ({ attempt, delayMs }) => {
+    console.log(`[main] Neither server reachable, retrying (attempt ${attempt}, delay ${Math.round(delayMs / 1000)}s)`);
+  });
+
+  connectionManager.on('connected', ({ url, mode }) => {
+    console.log(`[main] Connected to ${url} (mode: ${mode})`);
+    closeSearchingScreen();
+    serverUrl = url;
+    saveConfig(url, !!(config && config.manualOverride));
+    if (!mainWindow) {
+      createWindow();
+    }
+    updateTray();
+  });
+
+  connectionManager.on('switchServer', ({ url, mode, reason }) => {
+    console.log(`[main] Switching server to ${url} (mode: ${mode}, reason: ${reason || 'command'})`);
+    serverUrl = url;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadURL(serverUrl + PLAYER_PATH + '?platform=linux');
+    }
+    updateTray();
+  });
+
+  connectionManager.on('forceReload', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.reload();
+    }
+  });
+
+  connectionManager.on('remoteRestart', () => {
+    app.relaunch();
+    app.exit(0);
+  });
+
+  connectionManager.on('cloudChannelConnected', () => {
+    updateTray();
+  });
+
+  connectionManager.on('cloudChannelDisconnected', () => {
+    updateTray();
+  });
+
+  await connectionManager.autoConnect(config);
+}
+
 app.on('ready', async () => {
   protocol.handle('local-media', (request) => {
     const filePath = decodeURIComponent(request.url.replace('local-media://', ''));
@@ -408,28 +581,24 @@ app.on('ready', async () => {
   setupMediaIPC();
   createTray();
 
-  const hasConfig = loadConfig();
-  if (!hasConfig) {
-    await showSetupPrompt();
-  }
-  if (serverUrl) {
-    createWindow();
-  }
+  await startAutoConnect();
 });
 
 app.on('window-all-closed', () => {
   globalShortcut.unregisterAll();
+  if (connectionManager) connectionManager.stop();
   if (bonjourBrowser) bonjourBrowser.stop();
   app.quit();
 });
 
 app.on('activate', () => {
-  if (mainWindow === null) {
+  if (mainWindow === null && serverUrl) {
     createWindow();
   }
 });
 
 app.on('before-quit', () => {
   kioskMode = false;
+  if (connectionManager) connectionManager.stop();
   if (bonjourBrowser) bonjourBrowser.stop();
 });
